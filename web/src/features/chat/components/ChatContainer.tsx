@@ -1,6 +1,6 @@
 import { MessageSquarePlus } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import { useDockerAvailable } from '@/hooks/useSystemHealth'
+import { Button } from '@/components/ui/button'
 import { useChat } from '../hooks/useChat'
 import { AgentSelector } from './AgentSelector'
 import { ChatInput } from './ChatInput'
@@ -80,7 +80,7 @@ export function ChatContainer() {
       </div>
 
       {/* Input - Fixed */}
-      <div className='shrink-0 border-t'>
+      <div className='shrink-0 border-t bg-background'>
         <ChatInput
           onSend={handleSend}
           onAddFiles={addFiles}
@@ -92,9 +92,7 @@ export function ChatContainer() {
           onInterrupt={interrupt}
           canInterrupt={!!taskId && (isThinking || isLoading)}
           placeholder={
-            !agentId
-              ? 'Select an agent to start chatting'
-              : 'Type a message...'
+            !agentId ? 'Select an agent to start chatting' : 'Type a message...'
           }
         />
       </div>

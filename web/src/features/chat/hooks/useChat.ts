@@ -1,9 +1,111 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { api } from '@/services/api'
+import type { TaskEvent } from '@/types'
 import { useChatStore } from '@/stores/chat-store'
 import { useAgents } from '@/hooks/useAgents'
 import { useCreateTask, useAppendTurn, useCancelTask } from '@/hooks/useTasks'
-import { api } from '@/services/api'
-import type { TaskEvent } from '@/types'
+
+const noisyLineMatchers: Array<(line: string) => boolean> = [
+  (line) => /^\d{4}-\d{2}-\d{2}t/.test(line),
+  (line) => line.startsWith('error:'),
+  (line) => line.startsWith('error '),
+  (line) => line.startsWith('deprecated:'),
+  (line) => line.startsWith('mcp startup:'),
+  (line) => line.startsWith('openai codex'),
+  (line) => line.startsWith('workdir:'),
+  (line) => line.startsWith('exec '),
+  (line) => line.startsWith('model:'),
+  (line) => line.startsWith('provider:'),
+  (line) => line.startsWith('approval:'),
+  (line) => line.startsWith('sandbox:'),
+  (line) => line.startsWith('session id:'),
+  (line) => line.startsWith('user '),
+  (line) => line.startsWith('user:'),
+  (line) => line.includes('approval:'),
+  (line) => line.includes('sandbox:'),
+  (line) => line.includes('session id:'),
+  (line) => line.includes('model:'),
+  (line) => line.includes('provider:'),
+  (line) => line.includes('failed to refresh available models'),
+  (line) => line.includes('exceeded retry limit'),
+  (line) => line.includes('unexpected status 401'),
+  (line) => line.includes('too many requests'),
+]
+
+const cleanModelOutput = (input: string) => {
+  if (!input) return input
+  const lines = input.split('\n')
+  const kept: string[] = []
+  for (const rawLine of lines) {
+    let line = rawLine.trim()
+    if (!line) continue
+    const lower = line.toLowerCase()
+    if (noisyLineMatchers.some((match) => match(lower))) continue
+
+    // Strip mixed CLI logs in a single line: keep content before " exec ".
+    if (lower.includes(' exec ')) {
+      line = line.slice(0, lower.indexOf(' exec ')).trim()
+    }
+    if (lower.includes('codex ')) {
+      const codexIndex = lower.indexOf('codex ')
+      line = line.slice(codexIndex + 'codex '.length).trim()
+    }
+
+    // Drop leftover CLI execution lines.
+    const dropIfContains = [
+      ' exec ',
+      ' in /workspace',
+      'succeeded in',
+      'exited ',
+      'exit code',
+      'no such file or directory',
+      'unexpected status',
+      'plan update',
+      'execution failed',
+    ]
+    if (dropIfContains.some((needle) => line.toLowerCase().includes(needle)))
+      continue
+
+    // Remove stray role prefixes and inline traces.
+    // 更彻底地移除用户问题相关的内容
+    if (line.toLowerCase().startsWith('user ')) continue
+    if (line.toLowerCase().startsWith('user:')) continue
+    if (line.toLowerCase().startsWith('user：')) continue
+    if (line.toLowerCase().startsWith('assistant ')) {
+      line = line.slice('assistant '.length).trim()
+    }
+    if (line.toLowerCase().startsWith('assistant:')) {
+      line = line.slice('assistant:'.length).trim()
+    }
+    if (line.toLowerCase().startsWith('assistant：')) {
+      line = line.slice('assistant：'.length).trim()
+    }
+    
+    // 移除明显的用户问题行（仅在行首且整行都是问题时）
+    // 注意：不要过度过滤，因为AI回复也可能以这些词开头
+    // 只在非常明确的情况下（整行很短且以问号结尾）才过滤
+    if (line.length < 50 && line.match(/^(你|您).*[？?]$/)) {
+      // 可能是用户问题，跳过
+      continue
+    }
+    
+    line = line
+      .replace(/plan update\s*→.*$/i, '')
+      .replace(/\bexec\b.*$/i, '')
+      .trim()
+    if (line.toLowerCase().startsWith('exec ')) continue
+    if (line.toLowerCase().includes('exec cat:')) continue
+    if (line.toLowerCase().includes('no such file or directory')) continue
+    if (!line) continue
+    kept.push(line)
+  }
+  const cleaned = kept.length > 0 ? kept.join('\n') : ''
+  if (!cleaned) return ''
+  if (cleaned.includes('<') && cleaned.includes('>')) {
+    return cleaned.replace(/<[^>]*>/g, '').trim()
+  }
+  return cleaned
+}
 
 export function useChat() {
   const {
@@ -17,6 +119,7 @@ export function useChat() {
     setAgent,
     addMessage,
     setThinking,
+    setStreamingText,
     appendStreamingText,
     clearStreamingText,
     setConnected,
@@ -36,31 +139,58 @@ export function useChat() {
   const [isUploading, setIsUploading] = useState(false)
   const outputFetchInFlightRef = useRef(false)
   const lastOutputKeyRef = useRef<string | null>(null)
+  const lastAssistantHashRef = useRef<string | null>(null)
 
-  const finalizeFromOutput = useCallback(async (turnKey?: string) => {
-    const currentTaskId = useChatStore.getState().taskId
-    if (!currentTaskId) return
-    if (outputFetchInFlightRef.current) return
-    if (turnKey && lastOutputKeyRef.current === turnKey) return
+  const pushAssistantMessage = useCallback(
+    (content: string, status: 'sent' | 'error' = 'sent') => {
+      const cleaned = cleanModelOutput(content)
+      if (!cleaned) return
+      const hash = `${status}:${cleaned}`
+      if (lastAssistantHashRef.current === hash) return
+      const currentMessages = useChatStore.getState().messages
+      const last = currentMessages[currentMessages.length - 1]
+      if (
+        last &&
+        last.role === 'assistant' &&
+        last.content.trim() === cleaned.trim()
+      ) {
+        lastAssistantHashRef.current = hash
+        return
+      }
+      addMessage({
+        role: 'assistant',
+        content: cleaned,
+        status,
+      })
+      lastAssistantHashRef.current = hash
+    },
+    [addMessage]
+  )
 
-    outputFetchInFlightRef.current = true
-    try {
-      const output = await api.getTaskOutput(currentTaskId)
-      const text = typeof output === 'string' ? output : (output as { text?: string })?.text
-      if (text) {
-        addMessage({
-          role: 'assistant',
-          content: text,
-          status: 'sent',
-        })
+  const finalizeFromOutput = useCallback(
+    async (turnKey?: string) => {
+      const currentTaskId = useChatStore.getState().taskId
+      if (!currentTaskId) return
+      if (outputFetchInFlightRef.current) return
+      if (turnKey && lastOutputKeyRef.current === turnKey) return
+
+      outputFetchInFlightRef.current = true
+      try {
+        const output = await api.getTaskOutput(currentTaskId)
+        const text =
+          typeof output === 'string'
+            ? output
+            : (output as { text?: string })?.text
+        pushAssistantMessage(text || '')
+        if (turnKey) {
+          lastOutputKeyRef.current = turnKey
+        }
+      } finally {
+        outputFetchInFlightRef.current = false
       }
-      if (turnKey) {
-        lastOutputKeyRef.current = turnKey
-      }
-    } finally {
-      outputFetchInFlightRef.current = false
-    }
-  }, [addMessage])
+    },
+    [pushAssistantMessage]
+  )
 
   // Handle SSE events
   const handleEvent = useCallback(
@@ -78,67 +208,91 @@ export function useChat() {
         case 'agent.message': {
           const data = event.data as { text?: string; content?: string }
           const text = data?.text || data?.content || ''
-          if (text) {
-            appendStreamingText(text)
+          const cleaned = cleanModelOutput(text)
+          if (cleaned) {
+            const current = useChatStore.getState().streamingText
+            if (current && cleaned.startsWith(current)) {
+              setStreamingText(cleaned)
+            } else {
+              appendStreamingText(cleaned)
+            }
           }
           break
         }
 
         case 'task.completed':
         case 'task.turn_completed': {
-          // Finalize streaming text as a message
           const currentStreamingText = useChatStore.getState().streamingText
           if (currentStreamingText) {
-            addMessage({
-              role: 'assistant',
-              content: currentStreamingText,
-              status: 'sent',
-            })
+            pushAssistantMessage(currentStreamingText)
             clearStreamingText()
           } else {
-            const data = event.data as { turn_count?: number; turnCount?: number } | undefined
+            const data = event.data as
+              | { turn_count?: number; turnCount?: number; reason?: string }
+              | undefined
             const turnCount = data?.turn_count ?? data?.turnCount
             const currentTaskId = useChatStore.getState().taskId
-            const turnKey = currentTaskId && turnCount ? `${currentTaskId}:${turnCount}` : undefined
+            const turnKey =
+              currentTaskId && turnCount
+                ? `${currentTaskId}:${turnCount}`
+                : undefined
             void finalizeFromOutput(turnKey)
           }
           setThinking(false)
+          if (event.type === 'task.completed') {
+            const data = event.data as { reason?: string } | undefined
+            if (data?.reason === 'idle timeout') {
+              setTaskId(null)
+            }
+          }
           break
         }
 
         case 'task.failed':
         case 'task.cancelled': {
-          const data = event.data as { error?: string }
+          const data = event.data as { error?: string; http_code?: number; status_code?: number }
           const isCancelled = event.type === 'task.cancelled'
+          const errorMessage = data?.error || ''
+          const httpCode = data?.http_code || data?.status_code
+          const isRateLimit = httpCode === 429 || 
+            errorMessage.toLowerCase().includes('429') ||
+            errorMessage.toLowerCase().includes('rate limit') ||
+            errorMessage.toLowerCase().includes('too many requests')
+          
           const currentStreamingText = useChatStore.getState().streamingText
           if (currentStreamingText.trim()) {
-            addMessage({
-              role: 'assistant',
-              content: currentStreamingText,
-              status: isCancelled ? 'sent' : 'error',
-            })
+            pushAssistantMessage(
+              currentStreamingText,
+              isCancelled ? 'sent' : 'error'
+            )
             clearStreamingText()
           }
           if (isCancelled) {
-            // 添加中断提示消息
-            addMessage({
-              role: 'assistant',
-              content: '**任务已中断**\n\n用户取消了本次任务。',
-              status: 'sent',
-            })
+            pushAssistantMessage(
+              '**任务已中断**\n\n用户取消了本次任务。'
+            )
           } else if (!currentStreamingText.trim()) {
-            addMessage({
-              role: 'assistant',
-              content: data?.error || 'Task failed',
-              status: 'error',
-            })
+            // 429错误显示红色文本
+            const errorText = isRateLimit 
+              ? `**请求过于频繁 (429)**\n\n${errorMessage || 'API 请求频率过高，请稍后再试。'}`
+              : (errorMessage || 'Task failed')
+            pushAssistantMessage(errorText, 'error')
           }
           setThinking(false)
+          setTaskId(null)
           break
         }
       }
     },
-    [addMessage, appendStreamingText, clearStreamingText, setThinking]
+    [
+      appendStreamingText,
+      clearStreamingText,
+      finalizeFromOutput,
+      pushAssistantMessage,
+      setStreamingText,
+      setThinking,
+      setTaskId,
+    ]
   )
 
   // Connect to SSE when taskId changes
@@ -156,7 +310,6 @@ export function useChat() {
       setConnected(true)
     }
 
-    // 监听特定的事件类型
     es.addEventListener('task.started', (e) => {
       try {
         const data = JSON.parse(e.data)
@@ -267,7 +420,6 @@ export function useChat() {
         const file = files[i]
         const attachmentId = addAttachment(file)
 
-        // Start upload immediately
         const promise = uploadFile(attachmentId, file)
           .then(() => {})
           .catch(() => {
@@ -276,7 +428,6 @@ export function useChat() {
         uploadPromises.push(promise)
       }
 
-      // Wait for all uploads to complete
       await Promise.all(uploadPromises)
       setIsUploading(false)
     },
@@ -290,38 +441,32 @@ export function useChat() {
         throw new Error('Please select an agent first')
       }
 
-      // Get uploaded file IDs
       const attachmentIds = getUploadedFileIds()
 
-      // Build message content with attachment info
       let messageContent = prompt
       if (attachmentIds.length > 0) {
         const currentAttachments = useChatStore.getState().attachments
         const fileNames = currentAttachments
           .filter((att) => att.status === 'uploaded')
           .map((att) => att.file.name)
-        messageContent = `${prompt}\n\n📎 Attachments: ${fileNames.join(', ')}`
+        messageContent = `${prompt}
+
+Attachments: ${fileNames.join(', ')}`
       }
 
-      // Add user message immediately
       addMessage({
         role: 'user',
         content: messageContent,
         status: 'sent',
       })
 
-      // Clear attachments after adding to message
       clearAttachments()
-
       setThinking(true)
 
       try {
         if (taskId) {
-          // Append to existing task (multi-turn)
-          // Note: attachments are only supported for the first turn
           await appendTurn.mutateAsync({ taskId, prompt })
         } else {
-          // Create new task with attachments
           const task = await createTask.mutateAsync({
             agent_id: agentId,
             prompt,
@@ -331,11 +476,10 @@ export function useChat() {
         }
       } catch (error) {
         setThinking(false)
-        addMessage({
-          role: 'assistant',
-          content: error instanceof Error ? error.message : 'Failed to send message',
-          status: 'error',
-        })
+        pushAssistantMessage(
+          error instanceof Error ? error.message : 'Failed to send message',
+          'error'
+        )
       }
     },
     [
@@ -348,6 +492,7 @@ export function useChat() {
       appendTurn,
       getUploadedFileIds,
       clearAttachments,
+      pushAssistantMessage,
     ]
   )
 
@@ -358,7 +503,7 @@ export function useChat() {
     clearChat()
   }, [clearChat, setConnected])
 
-  // 中断当前任务（停止生成）
+  // Interrupt current task
   const interrupt = useCallback(() => {
     if (!taskId) return
     const currentTaskId = taskId
@@ -367,24 +512,21 @@ export function useChat() {
     cancelTask.mutate(currentTaskId)
     const currentStreamingText = useChatStore.getState().streamingText
     if (currentStreamingText.trim()) {
-      // 如果有部分内容，先保存已生成的内容
-      addMessage({
-        role: 'assistant',
-        content: currentStreamingText,
-        status: 'sent',
-      })
+      pushAssistantMessage(currentStreamingText)
       clearStreamingText()
     }
-    // 添加中断提示消息
-    addMessage({
-      role: 'assistant',
-      content: '**任务已中断**\n\n用户取消了本次任务。',
-      status: 'sent',
-    })
-    // 清除 taskId，让下次发送消息时创建新任务
+    pushAssistantMessage('**Task stopped**\n\nThe user cancelled this task.')
     setTaskId(null)
     setThinking(false)
-  }, [taskId, cancelTask, addMessage, clearStreamingText, setThinking, setTaskId, setConnected])
+  }, [
+    taskId,
+    cancelTask,
+    clearStreamingText,
+    pushAssistantMessage,
+    setThinking,
+    setTaskId,
+    setConnected,
+  ])
 
   return {
     // State

@@ -25,6 +25,7 @@ interface ChatState {
   addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void
   updateMessage: (id: string, updates: Partial<ChatMessage>) => void
   setThinking: (thinking: boolean) => void
+  setStreamingText: (text: string) => void
   appendStreamingText: (text: string) => void
   clearStreamingText: () => void
   setConnected: (connected: boolean) => void
@@ -81,6 +82,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     })),
 
   setThinking: (thinking) => set({ isThinking: thinking }),
+
+  setStreamingText: (text) => set({ streamingText: text }),
 
   appendStreamingText: (text) =>
     set((state) => ({

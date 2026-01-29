@@ -18,7 +18,7 @@ function ChatPage() {
           <ProfileDropdown />
         </div>
       </Header>
-      <Main className='flex flex-1 flex-col p-0'>
+      <Main fixed className='flex h-full min-h-0 flex-1 flex-col p-0'>
         <ChatContainer />
       </Main>
     </>

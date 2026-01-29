@@ -47,13 +47,13 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
       {/* Message content */}
       <div
         className={cn(
-          'flex max-w-[80%] flex-col gap-1',
+          'flex min-w-0 max-w-[80%] flex-col gap-1',
           isUser ? 'items-end' : 'items-start'
         )}
       >
         <div
           className={cn(
-            'rounded-2xl px-4 py-3',
+            'rounded-2xl px-4 py-3 break-words overflow-hidden',
             isUser
               ? 'rounded-tr-none bg-primary text-primary-foreground'
               : 'rounded-tl-none bg-muted',
@@ -62,7 +62,7 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
           )}
         >
           {isError && (
-            <div className='mb-2 flex items-center gap-1 text-destructive'>
+            <div className='mb-2 flex items-center gap-1 text-destructive font-medium'>
               <AlertCircle className='h-3 w-3' />
               <span className='text-xs'>Error</span>
             </div>
@@ -78,7 +78,7 @@ export function MessageItem({ message, isStreaming }: MessageItemProps) {
               className={cn(
                 'text-sm',
                 isUser && 'prose-invert',
-                isError && 'text-destructive'
+                isError && '[&_*]:!text-destructive'
               )}
             />
           )}

@@ -245,10 +245,50 @@
   }
 }
 
+/* Chat scroll area */
+.chat-scroll {
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.chat-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 10px 0;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(120, 120, 120, 0.4);
+  border-radius: 999px;
+}
+.dark .chat-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(200, 200, 200, 0.2);
+}
+
 /* CSS Variables for old components */
 :root {
   --border-color: hsl(var(--border));
   --bg-card: hsl(var(--card));
   --text-primary: hsl(var(--foreground));
   --text-secondary: hsl(var(--muted-foreground));
+}
+
+/* Markdown content tweaks */
+.markdown-content {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.markdown-content table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.markdown-content th,
+.markdown-content td {
+  vertical-align: top;
+}
+
+.markdown-content table code {
+  white-space: nowrap;
 }

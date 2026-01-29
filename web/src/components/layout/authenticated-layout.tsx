@@ -30,6 +30,7 @@ export function AuthenticatedLayout({ children }: AuthenticatedLayoutProps) {
             className={cn(
               '@container/content',
               'has-data-[layout=fixed]:h-svh',
+              'has-data-[layout=fixed]:min-h-0 has-data-[layout=fixed]:overflow-hidden',
               'peer-data-[variant=inset]:has-data-[layout=fixed]:h-[calc(100svh-(var(--spacing)*4))]'
             )}
           >
