@@ -79,11 +79,11 @@ type App struct {
 	// 多通道支持 (Phase 2)
 	Channel             *channel.Manager
 	ChannelSession      *channel.SessionManager
-	ChannelSessionStore channel.SessionStore  // 会话持久化存储
-	ChannelMessageStore channel.MessageStore  // 消息持久化存储
-	FeishuChannel       *feishu.Channel       // 飞书通道
-	WecomChannel        *wecom.Channel        // 企业微信通道
-	DingtalkChannel     *dingtalk.Channel     // 钉钉通道
+	ChannelSessionStore channel.SessionStore // 会话持久化存储
+	ChannelMessageStore channel.MessageStore // 消息持久化存储
+	FeishuChannel       *feishu.Channel      // 飞书通道
+	WecomChannel        *wecom.Channel       // 企业微信通道
+	DingtalkChannel     *dingtalk.Channel    // 钉钉通道
 
 	// 定时任务 (Phase 1)
 	Cron *cron.Manager
@@ -121,7 +121,7 @@ func (a *App) initialize() error {
 	var err error
 
 	// 1. 初始化容器管理器（Docker 不可用时降级为 NoopManager）
-	a.Container, err = container.NewDockerManager()
+	a.Container, err = container.NewDockerManagerWithConfig(a.Config)
 	if err != nil {
 		log.Warn("Docker manager initialization failed, running in degraded mode", "error", err)
 		a.Container = container.NewNoopManager()
@@ -266,9 +266,9 @@ func (a *App) initialize() error {
 	}
 
 	a.Batch = batch.NewManager(a.batchStore, a.Session, a.Agent, &batch.ManagerConfig{
-		MaxBatches:       10,                      // 最多同时运行 10 个 batch
-		PollInterval:     100 * time.Millisecond,  // 任务轮询间隔
-		ProgressInterval: 1 * time.Second,         // 进度更新间隔
+		MaxBatches:       10,                     // 最多同时运行 10 个 batch
+		PollInterval:     100 * time.Millisecond, // 任务轮询间隔
+		ProgressInterval: 1 * time.Second,        // 进度更新间隔
 		RedisQueue:       redisQueue,
 	})
 	log.Info("batch manager initialized")

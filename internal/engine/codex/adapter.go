@@ -118,8 +118,13 @@ func (a *Adapter) GenerateConfigTOML(cfg *engine.AgentConfig, apiKey string) str
 
 	// ===== 基础配置 =====
 	// model_provider - 模型提供商
-	if cfg.Model.Provider != "" {
-		sb.WriteString(fmt.Sprintf("model_provider = \"%s\"\n", cfg.Model.Provider))
+	// Zhipu 兼容：保持自定义 base_url 与 header 认证，强制走 chat wire_api
+	provider := cfg.Model.Provider
+	baseURL := cfg.Model.BaseURL
+	isZhipu := provider == "zhipu" || provider == "zm" ||
+		(strings.Contains(baseURL, "open.bigmodel.cn") && strings.Contains(baseURL, "/api/anthropic"))
+	if provider != "" {
+		sb.WriteString(fmt.Sprintf("model_provider = \"%s\"\n", provider))
 	}
 
 	// model - 默认模型
@@ -143,10 +148,6 @@ func (a *Adapter) GenerateConfigTOML(cfg *engine.AgentConfig, apiKey string) str
 
 	// ===== Provider 配置 =====
 	// 即使 Provider 或 BaseURL 为空，也尝试从环境变量推断
-	provider := cfg.Model.Provider
-	baseURL := cfg.Model.BaseURL
-
-	// 如果 Provider 为空但 BaseURL 存在，尝试从 BaseURL 推断 Provider
 	if provider == "" && baseURL != "" {
 		// 简单的推断逻辑
 		if strings.Contains(baseURL, "open.bigmodel.cn") {
@@ -160,7 +161,7 @@ func (a *Adapter) GenerateConfigTOML(cfg *engine.AgentConfig, apiKey string) str
 
 	// Codex 使用 OpenAI 兼容 API，需要将 zhipu 的 Anthropic 端点转换为 OpenAI 兼容端点
 	// 检查 provider 是否为 zhipu，或者 BaseURL 包含智谱AI的特征
-	isZhipu := provider == "zhipu" || (strings.Contains(baseURL, "open.bigmodel.cn") && strings.Contains(baseURL, "/api/anthropic"))
+	isZhipu = isZhipu || provider == "zhipu" || (strings.Contains(baseURL, "open.bigmodel.cn") && strings.Contains(baseURL, "/api/anthropic"))
 	if isZhipu && strings.Contains(baseURL, "/api/anthropic") {
 		// 将 /api/anthropic 转换为 /api/paas/v4 (OpenAI 兼容端点，用于 Codex)
 		// 注意：如果需要编码计划权限，可以使用 /api/coding/paas/v4
@@ -178,7 +179,11 @@ func (a *Adapter) GenerateConfigTOML(cfg *engine.AgentConfig, apiKey string) str
 		wireAPI := cfg.Model.WireAPI
 		if wireAPI == "" {
 			if providerName == "openai" {
-				wireAPI = "responses"
+				if isZhipu {
+					wireAPI = "chat"
+				} else {
+					wireAPI = "responses"
+				}
 			} else {
 				wireAPI = "chat"
 			}
@@ -187,7 +192,7 @@ func (a *Adapter) GenerateConfigTOML(cfg *engine.AgentConfig, apiKey string) str
 
 		// requires_openai_auth 和认证方式
 		if providerName == "openai" {
-			// OpenAI 官方：使用 requires_openai_auth = true，API key 通过 auth.json 传入
+			// OpenAI 官方：使用 auth.json 认证
 			sb.WriteString("requires_openai_auth = true\n")
 		} else {
 			// 第三方提供商：使用 http_headers 直接嵌入 Authorization 头
@@ -232,10 +237,10 @@ func (a *Adapter) GetConfigFiles(cfg *engine.AgentConfig, apiKey string) map[str
 	files["~/.codex/config.toml"] = configTOML
 
 	// ~/.codex/auth.json
-	// 只有官方 OpenAI 需要 auth.json（requires_openai_auth = true）
-	// 第三方 Provider 通过环境变量 OPENAI_API_KEY 传入（requires_openai_auth = false）
+	// OpenAI 兼容通道需要 auth.json（Zhipu 也复用该路径）
 	providerName := strings.ToLower(cfg.Model.Provider)
-	if apiKey != "" && providerName == "openai" {
+	isZhipu := providerName == "zhipu" || providerName == "zm" || strings.Contains(cfg.Model.BaseURL, "open.bigmodel.cn")
+	if apiKey != "" && (providerName == "openai" || isZhipu) {
 		files["~/.codex/auth.json"] = a.GenerateAuthJSON(apiKey)
 	}
 
@@ -245,47 +250,35 @@ func (a *Adapter) GetConfigFiles(cfg *engine.AgentConfig, apiKey string) map[str
 // PrepareExec 准备执行命令
 func (a *Adapter) PrepareExec(req *engine.ExecOptions) []string {
 	if req.ThreadID != "" {
-		// 多轮对话：codex 0.87+ 的 resume 支持 --json
-		args := []string{"codex", "exec", "resume", req.ThreadID, req.Prompt,
-			"--dangerously-bypass-approvals-and-sandbox",
-			"--skip-git-repo-check",
-			"--json",
-		}
-		return args
+		// 多轮对话：resume 子命令不接受额外参数
+		return []string{"codex", "exec", "resume", req.ThreadID, "-c", "skip_git_repo_check=true", "--", req.Prompt}
 	}
 
-	// 首轮：完整参数
-	args := []string{"codex", "exec", req.Prompt,
+	// 首轮：完整参数（flags 在前，prompt 在最后）
+	args := []string{
+		"codex", "exec",
 		"--dangerously-bypass-approvals-and-sandbox",
 		"--skip-git-repo-check",
 		"--json",
 	}
+	args = append(args, req.Prompt)
 	return args
 }
 
 // PrepareExecWithConfig 使用 AgentConfig 准备执行命令
 func (a *Adapter) PrepareExecWithConfig(req *engine.ExecOptions, cfg *engine.AgentConfig) []string {
 	if req.ThreadID != "" {
-		// 多轮对话：codex 0.87+ 的 resume 支持 --json、--model 等
-		args := []string{"codex", "exec", "resume", req.ThreadID, req.Prompt,
-			"--dangerously-bypass-approvals-and-sandbox",
-			"--skip-git-repo-check",
-			"--json",
-		}
-		if cfg.Model.Name != "" {
-			args = append(args, "--model", cfg.Model.Name)
-		}
-		return args
+		// 多轮对话：resume 子命令不接受额外参数
+		return []string{"codex", "exec", "resume", req.ThreadID, "-c", "skip_git_repo_check=true", "--", req.Prompt}
 	}
 
-	args := []string{"codex", "exec"}
-
-	// 首轮：完整参数
-	args = append(args, req.Prompt,
+	// 首轮：完整参数（flags 在前，prompt 在最后）
+	args := []string{
+		"codex", "exec",
 		"--dangerously-bypass-approvals-and-sandbox",
 		"--skip-git-repo-check",
 		"--json",
-	)
+	}
 
 	// ===== 模型配置 =====
 	if cfg.Model.Name != "" {
@@ -333,6 +326,8 @@ func (a *Adapter) PrepareExecWithConfig(req *engine.ExecOptions, cfg *engine.Age
 		args = append(args, "--output-schema", cfg.OutputSchema)
 	}
 
+	// prompt 必须放在最后，避免 flags 被解析为 prompt
+	args = append(args, req.Prompt)
 	return args
 }
 
@@ -459,6 +454,7 @@ type CodexItem struct {
 func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.ExecResult, error) {
 	var (
 		message           string
+		messageParts      []string
 		threadID          string
 		events            []engine.ExecEvent
 		usage             *engine.TokenUsage
@@ -517,6 +513,9 @@ func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.E
 		case "response.completed":
 			// 标记 response 已完成（Codex 的最终完成事件）
 			responseCompleted = true
+		case "response.output_text.done":
+			// 兼容部分版本的完成事件
+			responseCompleted = true
 
 		case "turn.failed":
 			if event.Error != nil {
@@ -532,6 +531,10 @@ func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.E
 					case "agent_message":
 						// 提取 agent_message 作为最终结果
 						message = item.Text
+					case "assistant_message", "assistant_text", "message", "output_text":
+						if item.Text != "" {
+							messageParts = append(messageParts, item.Text)
+						}
 					case "command_execution":
 						// 提取命令执行的退出码
 						if item.ExitCode != nil {
@@ -543,6 +546,14 @@ func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.E
 
 		case "error":
 			execErr = event.Message
+		case "response.output_text.delta":
+			if delta := extractStringField(line, "delta"); delta != "" {
+				messageParts = append(messageParts, delta)
+			}
+		case "response.output_text":
+			if text := extractStringField(line, "text"); text != "" {
+				messageParts = append(messageParts, text)
+			}
 		}
 	}
 
@@ -559,6 +570,10 @@ func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.E
 		if message == "" {
 			execErr = "stream disconnected before completion: stream closed before response.completed"
 		}
+	}
+
+	if message == "" && len(messageParts) > 0 {
+		message = strings.Join(messageParts, "")
 	}
 
 	// 如果没有解析到任何 JSON 事件，说明是纯文本输出（resume 模式）
@@ -580,6 +595,21 @@ func (a *Adapter) ParseJSONLOutput(output string, includeEvents bool) (*engine.E
 	}
 
 	return result, nil
+}
+
+func extractStringField(line string, field string) string {
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+		return ""
+	}
+	value, ok := raw[field]
+	if !ok {
+		return ""
+	}
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // stripDockerStreamHeaders 从 Docker 多路复用流中提取纯文本

@@ -201,12 +201,31 @@ func (m *Manager) Create(ctx context.Context, req *CreateRequest) (*Session, err
 		}
 	}
 
+	// Route through compat proxy for provider-backed sessions (unless agent overrides base_url).
+	if fullConfig != nil && fullConfig.Agent != nil && fullConfig.Provider != nil && fullConfig.Agent.BaseURLOverride == "" {
+		if compatProxyEnabled() {
+			if proxyURL := compatProxyURL(fullConfig.Agent.Adapter, fullConfig.Provider.ID); proxyURL != "" {
+				switch fullConfig.Agent.Adapter {
+				case engine.AdapterClaudeCode:
+					envVars["ANTHROPIC_BASE_URL"] = proxyURL
+				case engine.AdapterCodex, engine.AdapterOpenCode:
+					envVars["OPENAI_BASE_URL"] = proxyURL
+				}
+			}
+		}
+	}
+
 	// 请求中的 env 优先级最高
 	for k, v := range req.Env {
 		envVars[k] = v
 	}
 
 	// 准备容器配置
+	// Codex resume requires skipping git repo check via env.
+	if adapterName == engine.AdapterCodex {
+		envVars["CODEX_SKIP_GIT_REPO_CHECK"] = "1"
+	}
+
 	containerConfig := adapter.PrepareContainer(&engine.SessionInfo{
 		ID:        sessionID,
 		Workspace: workspace,
@@ -255,6 +274,14 @@ func (m *Manager) Create(ctx context.Context, req *CreateRequest) (*Session, err
 	}
 
 	// 写入配置文件（如果适配器需要）
+	// Codex resume does not accept --skip-git-repo-check, so trust workspace in git.
+	if adapter.Name() == engine.AdapterCodex {
+		_, err := m.containerMgr.Exec(ctx, ctr.ID, []string{"sh", "-c", "git init -q /workspace >/dev/null 2>&1 || true; git config --global --add safe.directory /workspace || true"})
+		if err != nil {
+			log.Warn("failed to set git safe.directory", "session_id", sessionID, "error", err)
+		}
+	}
+
 	if err := m.writeConfigFiles(ctx, adapter, ctr.ID, req, envVars); err != nil {
 		// 配置文件写入失败不中断创建，但记录警告
 		log.Warn("failed to write config files", "session_id", sessionID, "error", err)
@@ -354,6 +381,7 @@ func (m *Manager) writeConfigFiles(ctx context.Context, adapter engine.Adapter, 
 	// 从 AgentFullConfig 填充（如果通过 AgentID 创建）
 	if req.AgentID != "" && m.agentMgr != nil {
 		if fullConfig, err := m.agentMgr.GetFullConfig(req.AgentID); err == nil {
+			hasBaseURLOverride := fullConfig.Agent.BaseURLOverride != ""
 			cfg.ID = fullConfig.Agent.ID
 			cfg.Name = fullConfig.Agent.Name
 			cfg.Adapter = fullConfig.Agent.Adapter
@@ -386,8 +414,16 @@ func (m *Manager) writeConfigFiles(ctx context.Context, adapter engine.Adapter, 
 					}
 				}
 			}
+			// Apply compat proxy only when not explicitly overridden.
+			if !hasBaseURLOverride && compatProxyEnabled() {
+				if proxyURL := compatProxyURL(cfg.Adapter, cfg.Model.Provider); proxyURL != "" {
+					cfg.Model.BaseURL = proxyURL
+				}
+			}
 		}
 	}
+
+	// If base_url is still empty, do not force proxy.
 
 	// 从环境变量补充 Model 配置（优先级低于 Agent 配置）
 	if cfg.Model.BaseURL == "" {
@@ -439,13 +475,25 @@ func (m *Manager) writeConfigFiles(ctx context.Context, adapter engine.Adapter, 
 		return nil
 	}
 
+	// Resolve container HOME once to avoid relying on $HOME expansion in shell.
+	containerHome := ""
+	homeResult, err := m.containerMgr.Exec(ctx, containerID, []string{"sh", "-c", "echo $HOME"})
+	if err != nil {
+		log.Warn("failed to resolve container HOME, using fallback", "error", err)
+	} else {
+		containerHome = strings.TrimSpace(homeResult.Stdout)
+	}
+	if containerHome == "" || !strings.HasPrefix(containerHome, "/") {
+		containerHome = "/home/node"
+	}
+
 	// 通过 exec 命令写入每个配置文件
 	for filePath, content := range configFiles {
 		log.Debug("writing config file", "path", filePath, "content_len", len(content))
 
 		expandedPath := filePath
 		if strings.HasPrefix(filePath, "~/") {
-			expandedPath = "$HOME" + filePath[1:]
+			expandedPath = pathpkg.Join(containerHome, filePath[2:])
 		}
 
 		// Use POSIX-style path handling for container paths (Windows filepath would break $HOME/.codex -> $HOME\.codex).
@@ -461,6 +509,10 @@ func (m *Manager) writeConfigFiles(ctx context.Context, adapter engine.Adapter, 
 		if err != nil {
 			log.Error("failed to write config file", "path", filePath, "error", err)
 			return fmt.Errorf("failed to write file %s: %w", filePath, err)
+		}
+		if result.ExitCode != 0 {
+			log.Error("config file write failed", "path", filePath, "exit_code", result.ExitCode, "stderr", result.Stderr)
+			return fmt.Errorf("failed to write file %s: exit code %d", filePath, result.ExitCode)
 		}
 		log.Debug("config file written", "path", filePath, "exit_code", result.ExitCode)
 	}
@@ -1069,6 +1121,12 @@ func (m *Manager) execViaCLIWithJSONParser(parser engine.JSONOutputParser, opts 
 
 	// 更新执行记录
 	now := time.Now()
+	if parsed.Message == "" {
+		stderrMessage := strings.TrimSpace(stripDockerStreamHeaders(result.Stderr))
+		if stderrMessage != "" {
+			parsed.Message = stderrMessage
+		}
+	}
 	execution.EndedAt = &now
 	execution.Output = parsed.Message
 	execution.ExitCode = parsed.ExitCode
@@ -1118,6 +1176,13 @@ func (m *Manager) execViaCLIPlainText(opts *engine.ExecOptions, result *containe
 	// 从 Docker 多路复用流中提取纯文本
 	message := stripDockerStreamHeaders(result.Stdout)
 	message = strings.TrimSpace(message)
+	if message == "" {
+		stderrMessage := strings.TrimSpace(stripDockerStreamHeaders(result.Stderr))
+		if stderrMessage != "" {
+			message = stderrMessage
+		}
+	}
+	message = cleanCodexResumeOutput(message)
 
 	log.Debug("execViaCLIPlainText: resume output",
 		"raw_len", len(result.Stdout),
@@ -1182,6 +1247,48 @@ func stripDockerStreamHeaders(raw string) string {
 	}
 
 	return string(result)
+}
+
+// cleanCodexResumeOutput removes noisy Codex CLI logs from resume plain-text output.
+func cleanCodexResumeOutput(raw string) string {
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		return clean
+	}
+
+	lines := strings.Split(clean, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		l := strings.TrimSpace(line)
+		if l == "" {
+			continue
+		}
+		lower := strings.ToLower(l)
+		switch {
+		case strings.HasPrefix(l, "ERROR "),
+			strings.HasPrefix(lower, "deprecated:"),
+			strings.HasPrefix(lower, "mcp startup:"),
+			strings.HasPrefix(lower, "openai codex"),
+			strings.HasPrefix(lower, "workdir:"),
+			strings.HasPrefix(lower, "exec "),
+			strings.HasPrefix(lower, "model:"),
+			strings.HasPrefix(lower, "provider:"),
+			strings.HasPrefix(lower, "approval:"),
+			strings.HasPrefix(lower, "sandbox:"),
+			strings.HasPrefix(lower, "session id:"),
+			strings.HasPrefix(lower, "user "),
+			strings.HasPrefix(lower, "user:"),
+			strings.Contains(lower, "failed to refresh available models"),
+			strings.Contains(lower, "exceeded retry limit"):
+			continue
+		}
+		kept = append(kept, l)
+	}
+
+	if len(kept) == 0 {
+		return clean
+	}
+	return strings.Join(kept, "\n")
 }
 
 // ExecStream 流式执行命令，返回事件通道 (目前仅支持 Codex)
@@ -1740,5 +1847,47 @@ func buildEngineConfig(fullConfig *agent.AgentFullConfig) *engine.AgentConfig {
 		cfg.Resources.MemoryMB = fullConfig.Runtime.MemoryMB
 	}
 
+	// Route through compat proxy for provider-backed sessions (unless agent overrides base_url).
+	if fullConfig.Provider != nil && fullConfig.Agent.BaseURLOverride == "" && compatProxyEnabled() {
+		if proxyURL := compatProxyURL(cfg.Adapter, cfg.Model.Provider); proxyURL != "" {
+			cfg.Model.BaseURL = proxyURL
+		}
+	}
+
 	return cfg
+}
+
+func compatProxyEnabled() bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("AGENTBOX_COMPAT_PROXY")))
+	if raw == "" {
+		return true
+	}
+	switch raw {
+	case "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+func compatProxyBaseURL() string {
+	if base := strings.TrimSpace(os.Getenv("AGENTBOX_COMPAT_PROXY_BASE_URL")); base != "" {
+		return strings.TrimRight(base, "/")
+	}
+	return "http://host.docker.internal:18080"
+}
+
+func compatProxyURL(adapter, providerID string) string {
+	if providerID == "" {
+		return ""
+	}
+	base := compatProxyBaseURL()
+	switch adapter {
+	case engine.AdapterClaudeCode:
+		return base + "/api/v1/compat/anthropic/" + providerID
+	case engine.AdapterCodex, engine.AdapterOpenCode:
+		return base + "/api/v1/compat/openai/" + providerID
+	default:
+		return ""
+	}
 }

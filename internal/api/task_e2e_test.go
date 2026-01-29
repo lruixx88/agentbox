@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tmalldedede/agentbox/internal/session"
 	"github.com/tmalldedede/agentbox/internal/task"
 )
 
@@ -23,7 +24,7 @@ import (
 // ============================================================
 
 func TestMountAttachments_CopiesFilesToWorkspace(t *testing.T) {
-	_, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	_, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 模拟上传目录结构: uploadDir/file-id/filename.txt
@@ -54,7 +55,7 @@ func TestMountAttachments_CopiesFilesToWorkspace(t *testing.T) {
 }
 
 func TestMountAttachments_SkipsNonexistentFile(t *testing.T) {
-	_, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	_, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	uploadDir := filepath.Join(tempDir, "uploads")
@@ -74,7 +75,7 @@ func TestMountAttachments_SkipsNonexistentFile(t *testing.T) {
 }
 
 func TestMountAttachments_MultipleFiles(t *testing.T) {
-	_, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	_, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	uploadDir := filepath.Join(tempDir, "uploads")
@@ -110,7 +111,7 @@ func TestMountAttachments_MultipleFiles(t *testing.T) {
 // ============================================================
 
 func TestAppendTurn_ReturnsImmediately(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, sessionStore, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 创建一个 task 并手动设为 running + 有 session
@@ -127,6 +128,15 @@ func TestAppendTurn_ReturnsImmediately(t *testing.T) {
 	createdTask.StartedAt = &now
 	createdTask.Turns[0].Result = &task.Result{Text: "first turn result"}
 	require.NoError(t, taskMgr.UpdateTaskForTest(createdTask))
+
+	require.NoError(t, sessionStore.Create(&session.Session{
+		ID:          createdTask.SessionID,
+		Status:      session.StatusRunning,
+		Agent:       "claude-code",
+		AgentID:     createdTask.AgentID,
+		Workspace:   filepath.Join(tempDir, "workspaces", "mock-session-001"),
+		ContainerID: "mock-container-001",
+	}))
 
 	// 通过 API 追加轮次
 	appendReq := CreateTaskAPIRequest{
@@ -171,8 +181,71 @@ func TestAppendTurn_ReturnsImmediately(t *testing.T) {
 	assert.Nil(t, secondTurn["result"])
 }
 
+func TestAppendTurn_BroadcastsCompletionOnFailure(t *testing.T) {
+	router, _, taskMgr, sessionStore, tempDir := setupTaskTestRouter(t)
+	defer os.RemoveAll(tempDir)
+
+	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
+		AgentID: "test-agent",
+		Prompt:  "first turn prompt",
+	})
+	require.NoError(t, err)
+
+	createdTask.Status = task.StatusRunning
+	createdTask.SessionID = "mock-session-events"
+	now := time.Now()
+	createdTask.StartedAt = &now
+	createdTask.Turns[0].Result = &task.Result{Text: "first turn result"}
+	require.NoError(t, taskMgr.UpdateTaskForTest(createdTask))
+
+	require.NoError(t, sessionStore.Create(&session.Session{
+		ID:          createdTask.SessionID,
+		Status:      session.StatusRunning,
+		Agent:       "claude-code",
+		AgentID:     createdTask.AgentID,
+		Workspace:   filepath.Join(tempDir, "workspaces", "mock-session-events"),
+		ContainerID: "mock-container-events",
+	}))
+
+	eventsCh := taskMgr.SubscribeEvents(createdTask.ID)
+	defer taskMgr.UnsubscribeEvents(createdTask.ID, eventsCh)
+
+	appendReq := CreateTaskAPIRequest{
+		TaskID: createdTask.ID,
+		Prompt: "second turn prompt",
+	}
+	body, _ := json.Marshal(appendReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusCreated, w.Code)
+
+	gotTurnCompleted := false
+	gotFailed := false
+	timeout := time.After(3 * time.Second)
+
+	for !(gotTurnCompleted && gotFailed) {
+		select {
+		case <-timeout:
+			t.Fatalf("timeout waiting for events: turn_completed=%v failed=%v", gotTurnCompleted, gotFailed)
+		case event := <-eventsCh:
+			if event == nil {
+				continue
+			}
+			switch event.Type {
+			case "task.turn_completed":
+				gotTurnCompleted = true
+			case "task.failed":
+				gotFailed = true
+			}
+		}
+	}
+}
+
 func TestAppendTurn_InvalidTaskStatus(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 创建一个 queued 状态的 task
@@ -198,7 +271,7 @@ func TestAppendTurn_InvalidTaskStatus(t *testing.T) {
 }
 
 func TestAppendTurn_NoSession(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 创建 task 并设为 running 但没有 session
@@ -229,7 +302,7 @@ func TestAppendTurn_NoSession(t *testing.T) {
 }
 
 func TestAppendTurn_NonexistentTask(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	appendReq := CreateTaskAPIRequest{
@@ -251,7 +324,7 @@ func TestAppendTurn_NonexistentTask(t *testing.T) {
 // ============================================================
 
 func TestSSEStreamEvents_TerminalTask(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 创建一个已完成的 task
@@ -286,7 +359,7 @@ func TestSSEStreamEvents_TerminalTask(t *testing.T) {
 }
 
 func TestSSEStreamEvents_FailedTask(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
@@ -312,7 +385,7 @@ func TestSSEStreamEvents_FailedTask(t *testing.T) {
 }
 
 func TestSSEStreamEvents_CancelledTask(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
@@ -337,7 +410,7 @@ func TestSSEStreamEvents_CancelledTask(t *testing.T) {
 }
 
 func TestSSEStreamEvents_NotFound(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/nonexistent/events", nil)
@@ -349,7 +422,7 @@ func TestSSEStreamEvents_NotFound(t *testing.T) {
 }
 
 func TestSSEStreamEvents_LiveTask_ReceivesEvents(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// 创建一个 running 状态的 task
@@ -411,11 +484,11 @@ func TestSSEStreamEvents_LiveTask_ReceivesEvents(t *testing.T) {
 
 	// 验证收到了初始状态 + 3个事件
 	allEvents := strings.Join(events, "\n")
-	assert.Contains(t, allEvents, "event: task.status")       // 初始状态
-	assert.Contains(t, allEvents, "event: agent.thinking")    // thinking
-	assert.Contains(t, allEvents, "event: agent.message")     // message
-	assert.Contains(t, allEvents, "event: task.completed")    // completed
-	assert.Contains(t, allEvents, "hello from agent")         // message 内容
+	assert.Contains(t, allEvents, "event: task.status")    // 初始状态
+	assert.Contains(t, allEvents, "event: agent.thinking") // thinking
+	assert.Contains(t, allEvents, "event: agent.message")  // message
+	assert.Contains(t, allEvents, "event: task.completed") // completed
+	assert.Contains(t, allEvents, "hello from agent")      // message 内容
 }
 
 // ============================================================
@@ -423,7 +496,7 @@ func TestSSEStreamEvents_LiveTask_ReceivesEvents(t *testing.T) {
 // ============================================================
 
 func TestMultiTurn_CreateAndAppend(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, sessionStore, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// Step 1: 创建新 task
@@ -454,6 +527,14 @@ func TestMultiTurn_CreateAndAppend(t *testing.T) {
 	createdTask.StartedAt = &nowTime
 	createdTask.Turns[0].Result = &task.Result{Text: "def fib(n): ..."}
 	require.NoError(t, taskMgr.UpdateTaskForTest(createdTask))
+	require.NoError(t, sessionStore.Create(&session.Session{
+		ID:          createdTask.SessionID,
+		Status:      session.StatusRunning,
+		Agent:       "claude-code",
+		AgentID:     createdTask.AgentID,
+		Workspace:   filepath.Join(tempDir, "workspaces", "mock-session"),
+		ContainerID: "mock-container",
+	}))
 
 	// Step 3: 追加第二轮
 	appendReq := CreateTaskAPIRequest{
@@ -498,11 +579,11 @@ func TestMultiTurn_CreateAndAppend(t *testing.T) {
 	assert.Nil(t, turn2["result"])
 }
 
-func TestMultiTurn_CanAppendToCompletedTask(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+func TestMultiTurn_CannotAppendToCompletedTaskWithoutRunningSession(t *testing.T) {
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
-	// 创建 task 并设为 completed 状态（idle timeout 后自动完成的 task 可以追加轮次）
+	// 创建 task 并设为 completed 状态（无运行中的 session 时应拒绝追加轮次）
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
 		AgentID: "test-agent",
 		Prompt:  "completed by idle timeout",
@@ -529,13 +610,7 @@ func TestMultiTurn_CanAppendToCompletedTask(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusCreated, w.Code)
-
-	var resp Response
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
-	taskData, _ := resp.Data.(map[string]interface{})
-	assert.Equal(t, "running", taskData["status"]) // 重新激活为 running
-	assert.Equal(t, float64(2), taskData["turn_count"])
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
 // ============================================================
@@ -543,7 +618,7 @@ func TestMultiTurn_CanAppendToCompletedTask(t *testing.T) {
 // ============================================================
 
 func TestAllTaskRoutesRegistered(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	routes := []struct {
@@ -575,7 +650,7 @@ func TestAllTaskRoutesRegistered(t *testing.T) {
 // ============================================================
 
 func TestCreateTask_WithAttachments(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createReq := CreateTaskAPIRequest{
@@ -607,7 +682,7 @@ func TestCreateTask_WithAttachments(t *testing.T) {
 }
 
 func TestCreateTask_WithWebhookAndTimeout(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createReq := CreateTaskAPIRequest{

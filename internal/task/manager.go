@@ -412,6 +412,15 @@ func (m *Manager) appendTurn(req *CreateTaskRequest) (*Task, error) {
 	if task.SessionID == "" {
 		return nil, apperr.BadRequestf("task %s has no active session", task.ID)
 	}
+	if m.sessionMgr == nil {
+		return nil, apperr.BadRequestf("task %s session manager not available", task.ID)
+	}
+
+	// 验证 session 仍在运行，避免追加后无响应
+	sess, err := m.sessionMgr.Get(context.Background(), task.SessionID)
+	if err != nil || sess.Status != session.StatusRunning {
+		return nil, apperr.BadRequestf("task %s session not running; please start a new task", task.ID)
+	}
 
 	// 如果是 failed 任务，允许恢复继续对话（重置错误信息与完成时间）
 	if task.Status == StatusFailed {
@@ -451,12 +460,14 @@ func (m *Manager) appendTurn(req *CreateTaskRequest) (*Task, error) {
 func (m *Manager) executeTurn(taskID, turnID, prompt string) {
 	if m.sessionMgr == nil {
 		log.Error("executeTurn: sessionMgr is nil, cannot execute turn", "task_id", taskID)
+		m.failTask(taskID, "session manager not available")
 		return
 	}
 
 	task, err := m.store.Get(taskID)
 	if err != nil {
 		log.Error("executeTurn: failed to get task", "task_id", taskID, "error", err)
+		m.failTask(taskID, "failed to load task")
 		return
 	}
 
@@ -479,6 +490,8 @@ func (m *Manager) executeTurn(taskID, turnID, prompt string) {
 	if err != nil {
 		log.Error("executeTurn: exec failed", "task_id", taskID, "turn_id", turnID, "error", err)
 		m.updateTurnResult(taskID, turnID, &Result{Text: "exec error: " + err.Error()})
+		m.broadcastTurnCompleted(taskID, turnID, task.TurnCount, StatusFailed)
+		m.failTask(taskID, "exec error: "+err.Error())
 		return
 	}
 
@@ -501,19 +514,39 @@ func (m *Manager) executeTurn(taskID, turnID, prompt string) {
 	}
 
 	// 等待执行完成
+	turnSucceeded := false
 	result, err := m.waitExecution(m.ctx, task.SessionID, execResp.ExecutionID, time.Duration(timeout)*time.Second)
 	if err != nil {
 		m.updateTurnResult(taskID, turnID, &Result{Text: err.Error()})
+		m.broadcastTurnCompleted(taskID, turnID, task.TurnCount, StatusFailed)
+		m.failTask(taskID, err.Error())
 	} else {
 		m.updateTurnResult(taskID, turnID, result)
 		m.broadcastEvent(taskID, &TaskEvent{Type: "agent.message", Data: map[string]interface{}{
 			"turn_id": turnID,
 			"text":    result.Text,
 		}})
+		m.broadcastTurnCompleted(taskID, turnID, task.TurnCount, StatusRunning)
+		turnSucceeded = true
 	}
 
 	// 重置 idle timer
-	m.resetIdleTimer(taskID)
+	if turnSucceeded {
+		m.resetIdleTimer(taskID)
+	}
+}
+
+// broadcastTurnCompleted 发送 turn 完成事件（用于多轮对话 UI 收尾）
+func (m *Manager) broadcastTurnCompleted(taskID, turnID string, turnCount int, status Status) {
+	m.broadcastEvent(taskID, &TaskEvent{
+		Type: "task.turn_completed",
+		Data: map[string]interface{}{
+			"task_id":    taskID,
+			"turn_id":    turnID,
+			"turn_count": turnCount,
+			"status":     status,
+		},
+	})
 }
 
 // updateTurnResult 更新指定 Turn 的执行结果
@@ -1104,6 +1137,57 @@ func (m *Manager) completeTask(taskID string, reason string) {
 	// 广播事件
 	m.broadcastEvent(taskID, &TaskEvent{Type: "task.completed", Data: map[string]interface{}{
 		"reason": reason,
+	}})
+
+	// 发送 Webhook
+	if task.WebhookURL != "" {
+		go m.sendWebhook(task)
+	}
+}
+
+// failTask 标记任务失败并广播失败事件（用于多轮执行失败收尾）
+func (m *Manager) failTask(taskID, reason string) {
+	task, err := m.store.Get(taskID)
+	if err != nil {
+		log.Error("failTask: failed to get task", "task_id", taskID, "error", err)
+		return
+	}
+
+	if task.Status == StatusFailed || task.Status == StatusCancelled || task.Status == StatusCompleted {
+		return
+	}
+
+	log.Warn("failing task", "task_id", taskID, "reason", reason)
+
+	// 停止关联 session
+	if task.SessionID != "" && m.sessionMgr != nil {
+		m.sessionMgr.Stop(context.Background(), task.SessionID)
+	}
+
+	// 更新状态
+	now := time.Now()
+	task.Status = StatusFailed
+	task.ErrorMessage = reason
+	task.CompletedAt = &now
+
+	if err := m.store.Update(task); err != nil {
+		log.Error("failTask: failed to update", "task_id", taskID, "error", err)
+	}
+
+	// 清理 running map
+	m.runningMu.Lock()
+	if cancel, ok := m.running[taskID]; ok {
+		cancel()
+		delete(m.running, taskID)
+	}
+	m.runningMu.Unlock()
+
+	// 清理 idle timer
+	m.stopIdleTimer(taskID)
+
+	// 广播失败事件
+	m.broadcastEvent(taskID, &TaskEvent{Type: "task.failed", Data: map[string]interface{}{
+		"error": reason,
 	}})
 
 	// 发送 Webhook

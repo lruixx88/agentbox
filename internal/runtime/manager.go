@@ -217,11 +217,15 @@ func (m *Manager) loadCustomRuntimes() {
 	if err != nil {
 		return
 	}
+	builtinIDs := m.builtinIDSet()
 
 	// 尝试新格式
 	var persisted persistedData
 	if err := json.Unmarshal(data, &persisted); err == nil && persisted.Runtimes != nil {
 		for _, r := range persisted.Runtimes {
+			if builtinIDs[r.ID] {
+				continue
+			}
 			r.IsBuiltIn = false
 			m.runtimes[r.ID] = r
 		}
@@ -243,9 +247,20 @@ func (m *Manager) loadCustomRuntimes() {
 		return
 	}
 	for _, r := range runtimes {
+		if builtinIDs[r.ID] {
+			continue
+		}
 		r.IsBuiltIn = false
 		m.runtimes[r.ID] = r
 	}
+}
+
+func (m *Manager) builtinIDSet() map[string]bool {
+	ids := make(map[string]bool)
+	for _, r := range GetBuiltinRuntimes(m.cfg) {
+		ids[r.ID] = true
+	}
+	return ids
 }
 
 // savePersisted 保存完整持久化数据（default_id + 自定义运行时）

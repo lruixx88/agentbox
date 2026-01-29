@@ -14,26 +14,43 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/tmalldedede/agentbox/internal/config"
 )
 
 // DockerManager Docker 容器管理器实现
 type DockerManager struct {
-	client *client.Client
+	client         *client.Client
+	autoPullImages bool
 }
 
 // NewDockerManager 创建 Docker 管理器
 func NewDockerManager() (*DockerManager, error) {
+	return NewDockerManagerWithConfig(nil)
+}
+
+// NewDockerManagerWithConfig 创建 Docker 管理器（使用配置）
+func NewDockerManagerWithConfig(cfg *config.Config) (*DockerManager, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker client: %w", err)
 	}
 
-	return &DockerManager{client: cli}, nil
+	autoPull := false
+	if cfg != nil {
+		autoPull = cfg.Container.AutoPullImages
+	}
+
+	return &DockerManager{client: cli, autoPullImages: autoPull}, nil
 }
 
 // Create 创建容器
 func (m *DockerManager) Create(ctx context.Context, config *CreateConfig) (*Container, error) {
+	if err := m.ensureImage(ctx, config.Image); err != nil {
+		return nil, err
+	}
+
 	// 构建环境变量
 	env := make([]string, 0, len(config.Env))
 	for k, v := range config.Env {
@@ -90,6 +107,31 @@ func (m *DockerManager) Create(ctx context.Context, config *CreateConfig) (*Cont
 		Status: StatusCreated,
 		Labels: config.Labels,
 	}, nil
+}
+
+func (m *DockerManager) ensureImage(ctx context.Context, imageName string) error {
+	if imageName == "" {
+		return fmt.Errorf("image name is required")
+	}
+
+	_, _, err := m.client.ImageInspectWithRaw(ctx, imageName)
+	if err == nil {
+		return nil
+	}
+	if !errdefs.IsNotFound(err) {
+		return fmt.Errorf("failed to inspect image %s: %w", imageName, err)
+	}
+	if !m.autoPullImages {
+		return fmt.Errorf("image not found: %s", imageName)
+	}
+	if err := m.PullImage(ctx, imageName); err != nil {
+		return err
+	}
+	_, _, err = m.client.ImageInspectWithRaw(ctx, imageName)
+	if err != nil {
+		return fmt.Errorf("image not found after pull: %s", imageName)
+	}
+	return nil
 }
 
 // Start 启动容器

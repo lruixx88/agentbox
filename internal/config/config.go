@@ -53,15 +53,16 @@ type ServerConfig struct {
 
 // ContainerConfig 容器默认配置
 type ContainerConfig struct {
-	CPULimit      float64       `json:"cpu_limit"`      // CPU 核心数
-	MemoryLimit   int64         `json:"memory_limit"`   // 内存限制 (bytes)
-	DiskLimit     int64         `json:"disk_limit"`     // 磁盘限制 (bytes)
-	Timeout       time.Duration `json:"timeout"`        // 执行超时
-	NetworkMode   string        `json:"network_mode"`   // 网络模式
-	WorkspaceBase string        `json:"workspace_base"` // 工作空间基础目录
-	GCInterval    time.Duration `json:"gc_interval"`    // GC 扫描间隔
-	ContainerTTL  time.Duration `json:"container_ttl"`  // 容器最大存活时间
-	IdleTimeout   time.Duration `json:"idle_timeout"`   // Stopped 状态后多久删除
+	CPULimit       float64       `json:"cpu_limit"`        // CPU 核心数
+	MemoryLimit    int64         `json:"memory_limit"`     // 内存限制 (bytes)
+	DiskLimit      int64         `json:"disk_limit"`       // 磁盘限制 (bytes)
+	Timeout        time.Duration `json:"timeout"`          // 执行超时
+	NetworkMode    string        `json:"network_mode"`     // 网络模式
+	WorkspaceBase  string        `json:"workspace_base"`   // 工作空间基础目录
+	GCInterval     time.Duration `json:"gc_interval"`      // GC 扫描间隔
+	ContainerTTL   time.Duration `json:"container_ttl"`    // 容器最大存活时间
+	IdleTimeout    time.Duration `json:"idle_timeout"`     // Stopped 状态后多久删除
+	AutoPullImages bool          `json:"auto_pull_images"` // 镜像不存在时自动拉取
 }
 
 // StorageConfig 存储配置
@@ -85,15 +86,16 @@ func Default() *Config {
 			Port: 18080,
 		},
 		Container: ContainerConfig{
-			CPULimit:      2.0,
-			MemoryLimit:   4 * 1024 * 1024 * 1024,  // 4GB
-			DiskLimit:     10 * 1024 * 1024 * 1024, // 10GB
-			Timeout:       1 * time.Hour,
-			NetworkMode:   "bridge",
-			WorkspaceBase: "data/workspaces",
-			GCInterval:    60 * time.Second,
-			ContainerTTL:  2 * time.Hour,
-			IdleTimeout:   10 * time.Minute,
+			CPULimit:       2.0,
+			MemoryLimit:    4 * 1024 * 1024 * 1024,  // 4GB
+			DiskLimit:      10 * 1024 * 1024 * 1024, // 10GB
+			Timeout:        1 * time.Hour,
+			NetworkMode:    "bridge",
+			WorkspaceBase:  "data/workspaces",
+			GCInterval:     60 * time.Second,
+			ContainerTTL:   2 * time.Hour,
+			IdleTimeout:    10 * time.Minute,
+			AutoPullImages: true,
 		},
 		Storage: StorageConfig{
 			Type: "sqlite",
@@ -120,9 +122,9 @@ func Default() *Config {
 			RecoverInterval: 30 * time.Second, // 每 30 秒扫描超时任务
 		},
 		Runtime: RuntimeConfig{
-			DefaultImage:  "ghcr.io/tmalldedede/agentbox-agent:v2",
-			LightImage:    "ghcr.io/tmalldedede/agentbox-agent:v2",
-			HeavyImage:    "ghcr.io/tmalldedede/agentbox-agent:v2",
+			DefaultImage:  "agentbox/agent:v2",
+			LightImage:    "agentbox/agent:v2",
+			HeavyImage:    "agentbox/agent:v2",
 			BinaryREImage: "ghcr.io/tmalldedede/agentbox-agent:binary-re",
 		},
 	}
@@ -165,6 +167,9 @@ func Load() *Config {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Container.IdleTimeout = d
 		}
+	}
+	if v := os.Getenv("AGENTBOX_AUTO_PULL_IMAGES"); v != "" {
+		cfg.Container.AutoPullImages = v == "true" || v == "1"
 	}
 
 	// 文件存储配置

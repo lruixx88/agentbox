@@ -13,14 +13,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tmalldedede/agentbox/internal/agent"
+	"github.com/tmalldedede/agentbox/internal/container"
+	"github.com/tmalldedede/agentbox/internal/engine"
 	"github.com/tmalldedede/agentbox/internal/provider"
+	"github.com/tmalldedede/agentbox/internal/session"
 	"github.com/tmalldedede/agentbox/internal/task"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
 
-func setupTaskTestRouter(t *testing.T) (*gin.Engine, *TaskHandler, *task.Manager, string) {
+func setupTaskTestRouter(t *testing.T) (*gin.Engine, *TaskHandler, *task.Manager, *session.MemoryStore, string) {
 	// Create temp directory for test data
 	tempDir, err := os.MkdirTemp("", "task_test")
 	require.NoError(t, err)
@@ -29,8 +32,8 @@ func setupTaskTestRouter(t *testing.T) (*gin.Engine, *TaskHandler, *task.Manager
 	providerDataDir := filepath.Join(tempDir, "providers")
 	providerMgr := provider.NewManager(providerDataDir, "test-key-32bytes-for-aes256!!")
 	providerMgr.Create(&provider.Provider{
-		ID:   "test-provider",
-		Name: "Test Provider",
+		ID:     "test-provider",
+		Name:   "Test Provider",
 		Agents: []string{"claude-code"},
 	})
 
@@ -58,8 +61,13 @@ func setupTaskTestRouter(t *testing.T) (*gin.Engine, *TaskHandler, *task.Manager
 	store, err := task.NewGormStore(db)
 	require.NoError(t, err)
 
+	// Create session manager with noop container manager
+	sessionStore := session.NewMemoryStore()
+	sessionMgr := session.NewManager(sessionStore, container.NewNoopManager(), engine.DefaultRegistry(), filepath.Join(tempDir, "workspaces"))
+	sessionMgr.SetAgentManager(agentMgr)
+
 	// Create task manager (without starting the scheduler)
-	taskMgr := task.NewManager(store, agentMgr, nil, nil)
+	taskMgr := task.NewManager(store, agentMgr, sessionMgr, nil)
 
 	handler := NewTaskHandler(taskMgr)
 
@@ -67,11 +75,11 @@ func setupTaskTestRouter(t *testing.T) (*gin.Engine, *TaskHandler, *task.Manager
 	v1 := router.Group("/api/v1")
 	handler.RegisterRoutes(v1)
 
-	return router, handler, taskMgr, tempDir
+	return router, handler, taskMgr, sessionStore, tempDir
 }
 
 func TestTaskList(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks", nil)
@@ -94,12 +102,12 @@ func TestTaskList(t *testing.T) {
 }
 
 func TestTaskCreate(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createReq := CreateTaskAPIRequest{
 		AgentID: "test-agent",
-		Prompt:    "Hello, write a test",
+		Prompt:  "Hello, write a test",
 	}
 
 	body, _ := json.Marshal(createReq)
@@ -127,12 +135,12 @@ func TestTaskCreate(t *testing.T) {
 }
 
 func TestTaskCreateWithMetadata(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	createReq := CreateTaskAPIRequest{
 		AgentID: "test-agent",
-		Prompt:    "Test with metadata",
+		Prompt:  "Test with metadata",
 		Metadata: map[string]string{
 			"user_id": "user-123",
 			"source":  "api-test",
@@ -162,13 +170,13 @@ func TestTaskCreateWithMetadata(t *testing.T) {
 }
 
 func TestTaskGet(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// Create a task first
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
 		AgentID: "test-agent",
-		Prompt:    "Get test task",
+		Prompt:  "Get test task",
 	})
 	require.NoError(t, err)
 
@@ -190,7 +198,7 @@ func TestTaskGet(t *testing.T) {
 }
 
 func TestTaskGetNotFound(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/tasks/nonexistent-task-id", nil)
@@ -208,13 +216,13 @@ func TestTaskGetNotFound(t *testing.T) {
 }
 
 func TestTaskCancel(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// Create a task first
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
 		AgentID: "test-agent",
-		Prompt:    "Task to cancel",
+		Prompt:  "Task to cancel",
 	})
 	require.NoError(t, err)
 
@@ -236,13 +244,13 @@ func TestTaskCancel(t *testing.T) {
 }
 
 func TestTaskGetOutput(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// Create a task first
 	createdTask, err := taskMgr.CreateTask(&task.CreateTaskRequest{
 		AgentID: "test-agent",
-		Prompt:    "Task for output",
+		Prompt:  "Task for output",
 	})
 	require.NoError(t, err)
 
@@ -265,14 +273,14 @@ func TestTaskGetOutput(t *testing.T) {
 }
 
 func TestTaskListWithFilter(t *testing.T) {
-	router, _, taskMgr, tempDir := setupTaskTestRouter(t)
+	router, _, taskMgr, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	// Create some tasks
 	for i := 0; i < 3; i++ {
 		_, err := taskMgr.CreateTask(&task.CreateTaskRequest{
 			AgentID: "test-agent",
-			Prompt:    "Test task",
+			Prompt:  "Test task",
 		})
 		require.NoError(t, err)
 	}
@@ -302,7 +310,7 @@ func TestTaskListWithFilter(t *testing.T) {
 }
 
 func TestTaskValidation(t *testing.T) {
-	router, _, _, tempDir := setupTaskTestRouter(t)
+	router, _, _, _, tempDir := setupTaskTestRouter(t)
 	defer os.RemoveAll(tempDir)
 
 	tests := []struct {

@@ -32,64 +32,66 @@ import (
 
 // Server HTTP 服务器
 type Server struct {
-	httpServer        *http.Server
-	engine            *gin.Engine
-	authHandler       *AuthHandler
-	authManager       *auth.Manager
-	handler           *Handler
-	fileHandler       *FileHandler
-	publicFileHandler *PublicFileHandler
-	wsHandler         *WSHandler
-	providerHandler   *ProviderHandler
-	mcpHandler        *MCPHandler
-	skillHandler      *SkillHandler
-	imageHandler      *ImageHandler
-	systemHandler     *SystemHandler
-	taskHandler       *TaskHandler
-	webhookHandler    *WebhookHandler
-	runtimeHandler    *RuntimeHandler
-	agentHandler      *AgentHandler
-	historyHandler    *HistoryHandler
-	dashboardHandler  *DashboardHandler
-	batchHandler      *BatchHandler
-	settingsHandler   *SettingsHandler
-	cronHandler       *CronHandler
-	channelHandler    *ChannelHandler
-	feishuHandler     *FeishuHandler
-	wecomHandler      *WecomHandler
-	dingtalkHandler   *DingtalkHandler
-	coordinateHandler *CoordinateHandler
-	gatewayHandler    *GatewayHandler
-	oauthSyncHandler  *OAuthSyncAPI
+	httpServer         *http.Server
+	engine             *gin.Engine
+	authHandler        *AuthHandler
+	authManager        *auth.Manager
+	handler            *Handler
+	fileHandler        *FileHandler
+	publicFileHandler  *PublicFileHandler
+	wsHandler          *WSHandler
+	providerHandler    *ProviderHandler
+	mcpHandler         *MCPHandler
+	skillHandler       *SkillHandler
+	imageHandler       *ImageHandler
+	systemHandler      *SystemHandler
+	taskHandler        *TaskHandler
+	webhookHandler     *WebhookHandler
+	runtimeHandler     *RuntimeHandler
+	agentHandler       *AgentHandler
+	historyHandler     *HistoryHandler
+	dashboardHandler   *DashboardHandler
+	batchHandler       *BatchHandler
+	settingsHandler    *SettingsHandler
+	cronHandler        *CronHandler
+	channelHandler     *ChannelHandler
+	feishuHandler      *FeishuHandler
+	wecomHandler       *WecomHandler
+	dingtalkHandler    *DingtalkHandler
+	coordinateHandler  *CoordinateHandler
+	gatewayHandler     *GatewayHandler
+	oauthSyncHandler   *OAuthSyncAPI
+	zhipuCompatHandler *ZhipuCompatHandler
+	compatHandler      *CompatHandler
 }
 
 // Deps 服务器依赖（从 App 容器注入）
 type Deps struct {
-	Auth          *auth.Manager
-	Session       *session.Manager
-	Registry      *engine.Registry
-	Container     container.Manager
-	Provider      *provider.Manager
-	Runtime       *runtime.Manager
-	MCP           *mcp.Manager
-	Skill         *skill.Manager
-	Task          *task.Manager
-	Webhook       *webhook.Manager
-	Agent         *agent.Manager
-	History       *history.Manager
-	Batch         *batch.Manager
-	GC            *container.GarbageCollector
-	Settings      *settings.Manager
-	Cron          *cron.Manager
+	Auth            *auth.Manager
+	Session         *session.Manager
+	Registry        *engine.Registry
+	Container       container.Manager
+	Provider        *provider.Manager
+	Runtime         *runtime.Manager
+	MCP             *mcp.Manager
+	Skill           *skill.Manager
+	Task            *task.Manager
+	Webhook         *webhook.Manager
+	Agent           *agent.Manager
+	History         *history.Manager
+	Batch           *batch.Manager
+	GC              *container.GarbageCollector
+	Settings        *settings.Manager
+	Cron            *cron.Manager
 	Channel         *channel.Manager
 	FeishuChannel   *feishu.Channel
 	WecomChannel    *wecom.Channel
 	DingtalkChannel *dingtalk.Channel
 	Plugin          *plugin.Manager
-	Coordinate    *coordinate.Manager
-	FilesConfig   config.FilesConfig
-	FileStore     FileStore
-	OAuthSync     *oauth.SyncManager
+	Coordinate      *coordinate.Manager
+	FilesConfig     config.FilesConfig
+	FileStore       FileStore
+	OAuthSync       *oauth.SyncManager
 }
 
 // NewServer 创建服务器
@@ -126,36 +128,40 @@ func NewServer(deps *Deps) *Server {
 	coordinateHandler := NewCoordinateHandler(deps.Coordinate)
 	gatewayHandler := NewGatewayHandler(deps.Auth, deps.Task)
 	oauthSyncHandler := NewOAuthSyncAPI(deps.OAuthSync, deps.Provider)
+	zhipuCompatHandler := NewZhipuCompatHandler(deps.Provider)
+	compatHandler := NewCompatHandler(deps.Provider)
 
 	s := &Server{
-		engine:            engine,
-		authHandler:       authHandler,
-		authManager:       deps.Auth,
-		handler:           handler,
-		fileHandler:       fileHandler,
-		publicFileHandler: publicFileHandler,
-		wsHandler:         wsHandler,
-		providerHandler:   providerHandler,
-		runtimeHandler:    runtimeHandler,
-		mcpHandler:        mcpHandler,
-		skillHandler:      skillHandler,
-		imageHandler:      imageHandler,
-		systemHandler:     systemHandler,
-		taskHandler:       taskHandler,
-		webhookHandler:    webhookHandler,
-		agentHandler:      agentHandler,
-		historyHandler:    historyHandler,
-		dashboardHandler:  dashboardHandler,
-		batchHandler:      batchHandler,
-		settingsHandler:   settingsHandler,
-		cronHandler:       cronHandler,
-		channelHandler:    channelHandler,
-		feishuHandler:     feishuHandler,
-		wecomHandler:      wecomHandler,
-		dingtalkHandler:   dingtalkHandler,
-		coordinateHandler: coordinateHandler,
-		gatewayHandler:    gatewayHandler,
-		oauthSyncHandler:  oauthSyncHandler,
+		engine:             engine,
+		authHandler:        authHandler,
+		authManager:        deps.Auth,
+		handler:            handler,
+		fileHandler:        fileHandler,
+		publicFileHandler:  publicFileHandler,
+		wsHandler:          wsHandler,
+		providerHandler:    providerHandler,
+		runtimeHandler:     runtimeHandler,
+		mcpHandler:         mcpHandler,
+		skillHandler:       skillHandler,
+		imageHandler:       imageHandler,
+		systemHandler:      systemHandler,
+		taskHandler:        taskHandler,
+		webhookHandler:     webhookHandler,
+		agentHandler:       agentHandler,
+		historyHandler:     historyHandler,
+		dashboardHandler:   dashboardHandler,
+		batchHandler:       batchHandler,
+		settingsHandler:    settingsHandler,
+		cronHandler:        cronHandler,
+		channelHandler:     channelHandler,
+		feishuHandler:      feishuHandler,
+		wecomHandler:       wecomHandler,
+		dingtalkHandler:    dingtalkHandler,
+		coordinateHandler:  coordinateHandler,
+		gatewayHandler:     gatewayHandler,
+		oauthSyncHandler:   oauthSyncHandler,
+		zhipuCompatHandler: zhipuCompatHandler,
+		compatHandler:      compatHandler,
 	}
 
 	s.setupRoutes()
@@ -173,6 +179,11 @@ func (s *Server) setupRoutes() {
 	// ==================== 公开路由（无需认证）====================
 	v1.GET("/health", s.handler.HealthCheck)
 	v1.POST("/auth/login", s.authHandler.Login)
+	// Zhipu OpenAI-compatible proxy (role rewrite)
+	v1.Any("/compat/zhipu/*path", s.zhipuCompatHandler.Proxy)
+	// Provider-agnostic compat proxy
+	v1.Any("/compat/openai/:provider/*path", s.compatHandler.ProxyOpenAI)
+	v1.Any("/compat/anthropic/:provider/*path", s.compatHandler.ProxyAnthropic)
 
 	// WebSocket Gateway（通过消息认证，不需要 HTTP 层认证）
 	s.gatewayHandler.RegisterPublicRoutes(v1)
